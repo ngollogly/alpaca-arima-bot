@@ -1,0 +1,1 @@
+TIER1_SYMBOLS = ["DIA", "SPY", "XLF", "QQQ", "PG"]
