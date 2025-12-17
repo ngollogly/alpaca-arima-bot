@@ -1,22 +1,22 @@
-import argparse, sys, csv, os
-from datetime import datetime
+import argparse
+import sys
+
 from .config import settings
 from .logger import get_logger
 from .alpaca_client import AlpacaWrapper
-from .trade_logic import ToyStrategy
+from .generate_signals import build_signals_df
+from .trading_engine import execute_test_trades
+from .config_strategy import DEFAULT_PORTFOLIO
+from .update_data import update_portfolio_data
 
-LOG_FIELDS = ["ts", "symbol", "action", "notional", "order_id", "status", "message"]
-
-def write_trade_log(row: dict, path: str = "logs/trades.csv"):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    file_exists = os.path.isfile(path)
-    with open(path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=LOG_FIELDS)
-        if not file_exists:
-            w.writeheader()
-        w.writerow(row)
 
 def smoke_check(logger):
+    """
+    Simple connectivity test to Alpaca:
+    - gets account info
+    - logs status, equity, cash
+    - warns if trading is blocked
+    """
     try:
         alp = AlpacaWrapper()
         acc = alp.account()
@@ -28,50 +28,75 @@ def smoke_check(logger):
         logger.exception("Smoke check failed: %s", e)
         return False
 
-def run_test(symbol: str, allow_trade: bool, notional: float, logger):
-    strat = ToyStrategy(symbol=symbol, default_notional=notional or settings.default_notional)
-    signal = strat.next()
-    logger.info(f"Strategy signal: {signal}")
-    order_id = ""
-    status = "NOOP"
-    message = ""
 
-    if signal.action == "BUY" and allow_trade:
-        try:
-            alp = AlpacaWrapper()
-            o = alp.submit_market_buy(signal.symbol, signal.notional)
-            order_id = getattr(o, "id", "")
-            status = getattr(o, "status", "submitted")
-            message = "order submitted"
-            logger.info(f"Submitted BUY {signal.symbol} notional={signal.notional} order_id={order_id}")
-        except Exception as e:
-            status = "ERROR"
-            message = str(e)
-            logger.exception("Order submission failed")
+def run_strategy(portfolio: str, allow_trade: bool, notional: float, no_update: bool, update_only: bool, logger):
 
-    elif signal.action == "BUY" and not allow_trade:
-        message = "Dry run: trade suppressed (use --allow-trade to enable)"
-        logger.info(message)
+    """
+    End-to-end:
+    - build ARIMA-based signals for a portfolio
+    - print signals table
+    - optionally place tiny paper trades
+    """
+    if not no_update:
+        logger.info(f"Updating market data for portfolio='{portfolio}'...")
+        update_portfolio_data(portfolio_name=portfolio)
     else:
-        message = "No trade signal"
-        logger.info(message)
+        logger.info("Skipping data update (--no-update). Using existing CSVs.")
 
-    write_trade_log({
-        "ts": datetime.utcnow().isoformat(),
-        "symbol": symbol,
-        "action": signal.action,
-        "notional": signal.notional,
-        "order_id": order_id,
-        "status": status,
-        "message": message
-    })
+    if update_only:
+        logger.info("Update-only mode (--update-only). Exiting after data update.")
+        return
+
+    logger.info(f"Building signals for portfolio='{portfolio}'")
+    signals_df = build_signals_df(portfolio_name=portfolio)
+
+    print("=== Signals ===")
+    print(signals_df)
+
+    if not allow_trade:
+        logger.info("Dry run: NOT placing trades (use --allow-trade to enable).")
+        return
+
+    # If notional is 0 or negative, fall back to a small default (e.g., $1)
+    trade_notional = notional if notional > 0 else 1.0
+    logger.info(f"Placing paper trades at notional=${trade_notional:.2f} per symbol.")
+    execute_test_trades(signals_df, notional_usd=trade_notional)
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Alpaca bot starter")
-    parser.add_argument("--check", action="store_true", help="Smoke test (no orders)")
-    parser.add_argument("--test-symbol", default="AAPL", help="Symbol for test runs")
-    parser.add_argument("--allow-trade", action="store_true", help="Actually place a small paper trade if signaled")
-    parser.add_argument("--notional", type=float, default=0.0, help="USD notional for test trade (default from settings)")
+    parser = argparse.ArgumentParser(description="ARIMA-based Alpaca bot")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Smoke test Alpaca connection (no orders).",
+    )
+    parser.add_argument(
+        "--portfolio",
+        default=DEFAULT_PORTFOLIO,
+        help=f"Portfolio name to use (default: {DEFAULT_PORTFOLIO}).",
+    )
+    parser.add_argument(
+        "--allow-trade",
+        action="store_true",
+        help="Actually place small paper trades based on signals.",
+    )
+    parser.add_argument(
+        "--notional",
+        type=float,
+        default=0.0,
+        help="USD notional per trade (default: $1 if not specified).",
+    )
+    parser.add_argument(
+        "--no-update", 
+        action="store_true", 
+        help="Skip data update step.",
+    )
+    parser.add_argument(
+        "--update-only", 
+        action="store_true", 
+        help="Only update data then exit.",
+    )
+
     args = parser.parse_args()
 
     logger = get_logger("bot", settings.log_dir)
@@ -80,7 +105,16 @@ def main():
         ok = smoke_check(logger)
         sys.exit(0 if ok else 1)
 
-    run_test(symbol=args.test_symbol, allow_trade=args.allow_trade, notional=args.notional, logger=logger)
+    run_strategy(
+        portfolio=args.portfolio,
+        allow_trade=args.allow_trade,
+        notional=args.notional,
+        no_update=args.no_update,
+        update_only=args.update_only,
+        logger=logger,
+    )
+
+
 
 if __name__ == "__main__":
     main()
